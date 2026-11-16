@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from portfolio_core.marketdata.base import MarketDataProvider
 from portfolio_core.models import DuplicateTransaction, LedgerError
 
 from .schemas import (
@@ -19,10 +20,12 @@ from .schemas import (
     ImportOut,
     PortfolioIn,
     PortfolioOut,
+    RefreshOut,
     ReversalIn,
     RowIssueOut,
     TransactionIn,
     TransactionOut,
+    ValuationOut,
 )
 from .service import PortfolioService
 from .store import Conflict, NotFound, Store
@@ -31,7 +34,11 @@ StoreDependency = Callable[[], Iterator[Store]]
 MIN_TOKEN_LENGTH = 32
 
 
-def create_app(get_store: StoreDependency, api_token: str) -> FastAPI:
+def create_app(
+    get_store: StoreDependency,
+    api_token: str,
+    provider: MarketDataProvider | None = None,
+) -> FastAPI:
     """Build the app. ``get_store`` yields one store per request.
 
     Authentication is a single static bearer token for now. It is a stand-in
@@ -105,6 +112,22 @@ def create_app(get_store: StoreDependency, api_token: str) -> FastAPI:
     def holdings(portfolio_id: UUID, service: Service) -> HoldingsOut:
         portfolio, state = service.holdings(str(portfolio_id))
         return HoldingsOut.of(portfolio, state)
+
+    @api.get("/portfolios/{portfolio_id}/valuation")
+    def valuation(portfolio_id: UUID, service: Service) -> ValuationOut:
+        """Values holdings from stored prices. Run a price refresh first to update them."""
+        portfolio, val = service.valuation(str(portfolio_id))
+        _, state = service.holdings(str(portfolio_id))
+        return ValuationOut.of(portfolio, val, state.net_contributions_base)
+
+    @api.post("/portfolios/{portfolio_id}/prices/refresh")
+    def refresh_prices(portfolio_id: UUID, service: Service) -> RefreshOut:
+        """Fetches prices and FX for current holdings. Each call spends provider API quota."""
+        if provider is None:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "no market data provider is configured"
+            )
+        return RefreshOut.of(service.refresh_prices(str(portfolio_id), provider))
 
     @api.get("/portfolios/{portfolio_id}/audit")
     def audit(portfolio_id: UUID, service: Service) -> list[AuditOut]:

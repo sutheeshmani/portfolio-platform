@@ -16,6 +16,7 @@ from psycopg.rows import DictRow, dict_row
 from psycopg.types.json import Jsonb
 
 from portfolio_core.models import CostMethod, SecurityKey, Transaction, TxType, fingerprint
+from portfolio_core.valuation import FxQuote, PriceType, Quote
 
 from .store import (
     AuditRecord,
@@ -243,3 +244,54 @@ class PostgresStore:
             )
             for r in rows
         ]
+
+    # -- market data -----------------------------------------------------
+    def save_quote(self, quote: Quote) -> None:
+        security_id = self._security_id(quote.security, quote.currency)
+        self._conn.execute(
+            "INSERT INTO market_price (security_id, price_timestamp, price_type, close_price,"
+            " source) VALUES (%s, %s, %s, %s, %s)"
+            " ON CONFLICT (security_id, price_timestamp, price_type, source) DO NOTHING",
+            (security_id, quote.as_of, quote.price_type.value, quote.price, quote.source),
+        )
+
+    def latest_quotes(self, securities: Sequence[SecurityKey]) -> dict[SecurityKey, Quote]:
+        if not securities:
+            return {}
+        rows = self._conn.execute(
+            "SELECT DISTINCT ON (s.security_id) s.symbol, s.exchange_code, s.currency_code,"
+            " p.price_timestamp, p.price_type, p.close_price, p.source"
+            " FROM market_price p JOIN security s ON s.security_id = p.security_id"
+            " WHERE (s.symbol, s.exchange_code) IN (SELECT * FROM unnest(%s::text[], %s::text[]))"
+            " ORDER BY s.security_id, p.price_timestamp DESC, p.fetched_at DESC",
+            ([k.symbol for k in securities], [k.exchange for k in securities]),
+        ).fetchall()
+        out: dict[SecurityKey, Quote] = {}
+        for r in rows:
+            key = SecurityKey(r["symbol"], r["exchange_code"])
+            out[key] = Quote(
+                key, r["close_price"], r["currency_code"], r["price_timestamp"],
+                PriceType(r["price_type"]), r["source"],
+            )
+        return out
+
+    def save_fx(self, fx: FxQuote) -> None:
+        self._conn.execute(
+            "INSERT INTO fx_rate (from_currency, to_currency, rate, rate_timestamp, source)"
+            " VALUES (%s, %s, %s, %s, %s)"
+            " ON CONFLICT (from_currency, to_currency, rate_timestamp, source) DO NOTHING",
+            (fx.from_currency, fx.to_currency, fx.rate, fx.as_of, fx.source),
+        )
+
+    def latest_fx(self, from_currency: str, to_currency: str) -> FxQuote | None:
+        row = self._conn.execute(
+            "SELECT rate, rate_timestamp, source FROM fx_rate"
+            " WHERE from_currency = %s AND to_currency = %s"
+            " ORDER BY rate_timestamp DESC, fetched_at DESC LIMIT 1",
+            (from_currency, to_currency),
+        ).fetchone()
+        if row is None:
+            return None
+        return FxQuote(
+            from_currency, to_currency, row["rate"], row["rate_timestamp"], row["source"]
+        )
