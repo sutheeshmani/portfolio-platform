@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
 
@@ -150,7 +150,7 @@ def fingerprint(tx: Transaction) -> str:
             tx.portfolio_id,
             tx.type.value,
             str(tx.security) if tx.security else "",
-            tx.trade_date.isoformat(),
+            tx.trade_date.astimezone(UTC).isoformat(),  # same instant, same hash
             tx.currency,
             _norm(tx.quantity),
             _norm(tx.unit_price),
