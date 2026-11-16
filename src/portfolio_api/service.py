@@ -9,7 +9,8 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
 
@@ -20,13 +21,16 @@ from portfolio_core.importers.csv_import import (
     preview_import,
     suggest_mapping,
 )
+from portfolio_core.marketdata.base import MarketDataError, MarketDataProvider
 from portfolio_core.models import (
     CostMethod,
     DuplicateTransaction,
     LedgerError,
+    SecurityKey,
     Transaction,
     fingerprint,
 )
+from portfolio_core.valuation import FxQuote, PortfolioValuation, Quote, value_portfolio
 
 from .store import AuditRecord, ImportBatch, PortfolioRecord, Store, StoredTransaction
 
@@ -41,6 +45,14 @@ class ImportResult:
     mapping: ColumnMapping
     preview: ImportPreview
     committed: int
+
+
+@dataclass
+class RefreshResult:
+    quotes: dict[SecurityKey, Quote] = field(default_factory=dict)
+    missing: dict[SecurityKey, str] = field(default_factory=dict)
+    fx: dict[str, FxQuote] = field(default_factory=dict)
+    fx_missing: dict[str, str] = field(default_factory=dict)
 
 
 class PortfolioService:
@@ -133,6 +145,64 @@ class PortfolioService:
     def audit(self, portfolio_id: str) -> list[AuditRecord]:
         self.store.get_portfolio(portfolio_id)
         return self.store.audit(portfolio_id)
+
+    # -- market data and valuation ----------------------------------------
+    def refresh_prices(self, portfolio_id: str, provider: MarketDataProvider) -> RefreshResult:
+        """Fetch prices for current holdings and FX for every foreign currency held.
+
+        Network calls happen before the database transaction; results are then
+        stored together. A provider failure for one item never blocks the rest.
+        """
+        portfolio, state = self.holdings(portfolio_id)
+        result = RefreshResult()
+        securities = sorted(state.positions)
+        batch = getattr(provider, "get_quotes", None)
+        if securities and callable(batch):
+            result.quotes, result.missing = batch(securities)
+        else:
+            for sec in securities:
+                try:
+                    result.quotes[sec] = provider.get_quote(sec)
+                except MarketDataError as exc:
+                    result.missing[sec] = str(exc)
+
+        currencies = {p.currency for p in state.positions.values()} | set(state.cash)
+        for ccy in sorted(currencies - {portfolio.base_currency}):
+            try:
+                result.fx[ccy] = provider.get_fx(ccy, portfolio.base_currency)
+            except MarketDataError as exc:
+                result.fx_missing[ccy] = str(exc)
+
+        with self.store.transaction():
+            for quote in result.quotes.values():
+                self.store.save_quote(quote)
+            for fx in result.fx.values():
+                self.store.save_fx(fx)
+            self.store.add_audit(
+                "PRICES_REFRESHED", "portfolio", portfolio_id,
+                {
+                    "portfolio_id": portfolio_id,
+                    "updated": sorted(str(k) for k in result.quotes),
+                    "missing": sorted(str(k) for k in result.missing),
+                    "fx_updated": sorted(result.fx),
+                    "fx_missing": sorted(result.fx_missing),
+                },
+            )
+        return result
+
+    def valuation(
+        self, portfolio_id: str, as_of: datetime | None = None
+    ) -> tuple[PortfolioRecord, PortfolioValuation]:
+        """Values the portfolio from stored prices only; it never calls a provider."""
+        portfolio, state = self.holdings(portfolio_id)
+        quotes = self.store.latest_quotes(sorted(state.positions))
+        currencies = {p.currency for p in state.positions.values()} | set(state.cash)
+        fx_rates: dict[str, FxQuote] = {}
+        for ccy in currencies - {portfolio.base_currency}:
+            fx = self.store.latest_fx(ccy, portfolio.base_currency)
+            if fx is not None:
+                fx_rates[ccy] = fx
+        return portfolio, value_portfolio(state, quotes, fx_rates, as_of or datetime.now(UTC))
 
     # -- CSV import ------------------------------------------------------
     def import_csv(

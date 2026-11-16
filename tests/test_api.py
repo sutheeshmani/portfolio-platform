@@ -125,3 +125,46 @@ def test_csv_import_endpoint(client, pid):
 
     bad = {"portfolio_id": pid, "csv_text": "a,b\n1,2\n"}
     assert client.post("/api/v1/transactions/import", json=bad).status_code == 422
+
+
+def test_valuation_and_refresh_endpoints(store, pid):
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from portfolio_core.valuation import PriceType, Quote
+
+    class Provider:
+        name = "fake"
+
+        def get_quote(self, sec):
+            stamp = datetime.now(UTC)
+            return Quote(sec, Decimal("12"), "AUD", stamp, PriceType.DELAYED, "fake")
+
+        def get_fx(self, a, b):
+            raise AssertionError("no foreign currency held")
+
+    def get_store():
+        yield store
+
+    plain = TestClient(create_app(get_store, TOKEN), headers=AUTH)
+    assert plain.post(f"/api/v1/portfolios/{pid}/prices/refresh").status_code == 503
+
+    client = TestClient(create_app(get_store, TOKEN, Provider()), headers=AUTH)
+    client.post("/api/v1/transactions", json={
+        "portfolio_id": pid, "type": "DEPOSIT", "trade_date": "2026-02-01T10:00:00+11:00",
+        "currency": "AUD", "amount": "2000"})
+    client.post("/api/v1/transactions", json=buy(pid))
+
+    before = client.get(f"/api/v1/portfolios/{pid}/valuation").json()
+    assert before["complete"] is False and before["issues"] == ["MISSING_PRICE XYZ:ASX"]
+
+    r = client.post(f"/api/v1/portfolios/{pid}/prices/refresh").json()
+    assert list(r["updated"]) == ["XYZ:ASX"] and r["updated"]["XYZ:ASX"]["price_type"] == "DELAYED"
+
+    v = client.get(f"/api/v1/portfolios/{pid}/valuation").json()
+    assert v["complete"] is True
+    assert Decimal(v["holdings_value_base"]) == 1200
+    assert Decimal(v["unrealised_base"]) == 190          # PRD 14.3 example 1
+    assert Decimal(v["cash_value_base"]) == 990
+    assert Decimal(v["invested_capital_base"]) == 2000
+    assert v["holdings"][0]["quote"]["source"] == "fake"

@@ -13,7 +13,8 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import uuid4
 
-from portfolio_core.models import CostMethod, Transaction, fingerprint
+from portfolio_core.models import CostMethod, SecurityKey, Transaction, fingerprint
+from portfolio_core.valuation import FxQuote, Quote
 
 
 class NotFound(LookupError):
@@ -97,6 +98,14 @@ class Store(Protocol):
 
     def audit(self, portfolio_id: str) -> list[AuditRecord]: ...
 
+    def save_quote(self, quote: Quote) -> None: ...
+
+    def latest_quotes(self, securities: Sequence[SecurityKey]) -> dict[SecurityKey, Quote]: ...
+
+    def save_fx(self, fx: FxQuote) -> None: ...
+
+    def latest_fx(self, from_currency: str, to_currency: str) -> FxQuote | None: ...
+
 
 class InMemoryStore:
     """Reference implementation used by tests and local experiments."""
@@ -110,18 +119,25 @@ class InMemoryStore:
         self._audit: list[AuditRecord] = []
         self._seq = 0
         self._depth = 0
+        self._quotes: list[Quote] = []
+        self._fx: list[FxQuote] = []
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
         if self._depth:
             yield
             return
-        snapshot = (dict(self._portfolios), list(self._txs), list(self._audit), self._seq)
+        snapshot = (
+            dict(self._portfolios), list(self._txs), list(self._audit), self._seq,
+            list(self._quotes), list(self._fx),
+        )
         self._depth += 1
         try:
             yield
         except BaseException:
-            self._portfolios, self._txs, self._audit, self._seq = snapshot
+            (
+                self._portfolios, self._txs, self._audit, self._seq, self._quotes, self._fx
+            ) = snapshot
             raise
         finally:
             self._depth -= 1
@@ -178,3 +194,28 @@ class InMemoryStore:
 
     def audit(self, portfolio_id: str) -> list[AuditRecord]:
         return [a for a in self._audit if a.detail.get("portfolio_id") == portfolio_id]
+
+    def save_quote(self, quote: Quote) -> None:
+        self._quotes.append(quote)
+
+    def latest_quotes(self, securities: Sequence[SecurityKey]) -> dict[SecurityKey, Quote]:
+        wanted = set(securities)
+        out: dict[SecurityKey, Quote] = {}
+        for q in self._quotes:  # later saves win ties
+            if q.security in wanted and (
+                q.security not in out or q.as_of >= out[q.security].as_of
+            ):
+                out[q.security] = q
+        return out
+
+    def save_fx(self, fx: FxQuote) -> None:
+        self._fx.append(fx)
+
+    def latest_fx(self, from_currency: str, to_currency: str) -> FxQuote | None:
+        pair = (from_currency, to_currency)
+        rows = [f for f in self._fx if (f.from_currency, f.to_currency) == pair]
+        best: FxQuote | None = None
+        for f in rows:
+            if best is None or f.as_of >= best.as_of:
+                best = f
+        return best

@@ -12,7 +12,9 @@ from pydantic import AwareDatetime, BaseModel, BeforeValidator, ConfigDict, Fiel
 from portfolio_core.engine import PortfolioState
 from portfolio_core.importers.csv_import import ColumnMapping, RowIssue
 from portfolio_core.models import CostMethod, SecurityKey, Transaction, TxType
+from portfolio_core.valuation import FxQuote, PortfolioValuation, PriceType, Quote
 
+from .service import RefreshResult
 from .store import AuditRecord, PortfolioRecord, StoredTransaction
 
 _EIGHT_DP = Decimal("0.00000001")
@@ -267,4 +269,124 @@ class AuditOut(BaseModel):
         return cls(
             occurred_at=a.occurred_at, action=a.action, entity_type=a.entity_type,
             entity_id=a.entity_id, detail=a.detail,
+        )
+
+
+class QuoteOut(BaseModel):
+    price: Decimal
+    currency: str
+    as_of: datetime
+    price_type: PriceType
+    source: str
+
+    @classmethod
+    def of(cls, q: Quote) -> QuoteOut:
+        return cls(
+            price=q.price, currency=q.currency, as_of=q.as_of,
+            price_type=q.price_type, source=q.source,
+        )
+
+
+class FxOut(BaseModel):
+    from_currency: str
+    to_currency: str
+    rate: Decimal
+    as_of: datetime
+    source: str
+
+    @classmethod
+    def of(cls, fx: FxQuote) -> FxOut:
+        return cls(
+            from_currency=fx.from_currency, to_currency=fx.to_currency, rate=fx.rate,
+            as_of=fx.as_of, source=fx.source,
+        )
+
+
+class HoldingValueOut(BaseModel):
+    symbol: str
+    exchange: str
+    currency: str
+    quantity: Decimal
+    cost_local: Decimal
+    cost_base: Decimal
+    quote: QuoteOut | None
+    fx: FxOut | None
+    market_value_local: Decimal | None
+    market_value_base: Decimal | None
+    unrealised_base: Decimal | None
+    price_effect_base: Decimal | None
+    fx_effect_base: Decimal | None
+    weight: Decimal | None
+    stale: bool
+    issue: str | None
+
+
+class ValuationOut(BaseModel):
+    """Totals cover only what could be priced: check ``complete`` and ``issues``."""
+
+    portfolio_id: str
+    base_currency: str
+    as_of: datetime
+    complete: bool
+    total_value_base: Decimal
+    holdings_value_base: Decimal
+    cash_value_base: Decimal
+    invested_capital_base: Decimal
+    unrealised_base: Decimal
+    realised_base: Decimal
+    cash_local: dict[str, Decimal]
+    currency_exposure_base: dict[str, Decimal]
+    holdings: list[HoldingValueOut]
+    issues: list[str]
+
+    @classmethod
+    def of(
+        cls, portfolio: PortfolioRecord, v: PortfolioValuation, invested: Decimal
+    ) -> ValuationOut:
+        return cls(
+            portfolio_id=portfolio.id,
+            base_currency=v.base_currency,
+            as_of=v.as_of,
+            complete=v.complete,
+            total_value_base=v.total_value_base,
+            holdings_value_base=v.holdings_value_base,
+            cash_value_base=v.cash_value_base,
+            invested_capital_base=invested,
+            unrealised_base=v.unrealised_base,
+            realised_base=v.realised_base,
+            cash_local=v.cash_local,
+            currency_exposure_base=v.currency_exposure_base,
+            holdings=[
+                HoldingValueOut(
+                    symbol=h.security.symbol, exchange=h.security.exchange,
+                    currency=h.currency, quantity=h.quantity,
+                    cost_local=h.cost_local, cost_base=h.cost_base,
+                    quote=QuoteOut.of(h.quote) if h.quote else None,
+                    fx=FxOut.of(h.fx) if h.fx else None,
+                    market_value_local=h.market_value_local,
+                    market_value_base=h.market_value_base,
+                    unrealised_base=h.unrealised_base,
+                    price_effect_base=h.price_effect_base,
+                    fx_effect_base=h.fx_effect_base,
+                    weight=h.weight, stale=h.stale, issue=h.issue,
+                )
+                for h in v.holdings
+            ],
+            issues=v.issues,
+        )
+
+
+class RefreshOut(BaseModel):
+    updated: dict[str, QuoteOut]
+    missing: dict[str, str]
+    fx_updated: dict[str, FxOut]
+    fx_missing: dict[str, str]
+
+    @classmethod
+    def of(cls, r: RefreshResult) -> RefreshOut:
+        return cls(
+            updated={str(k): QuoteOut.of(q) for k, q in sorted(r.quotes.items())},
+            missing={str(k): why for k, why in sorted(r.missing.items())},
+            fx_updated={c: FxOut.of(f) for c, f in sorted(r.fx.items())},
+            fx_missing=dict(sorted(r.fx_missing.items())),
         )
