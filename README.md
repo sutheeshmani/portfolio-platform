@@ -38,6 +38,22 @@ pytest -q            # Postgres tests run when DATABASE_URL is set, otherwise th
 ruff check . && mypy
 ```
 
+## Web app (`frontend/`)
+
+Next.js (App Router), TypeScript and Tailwind. It has the full navigation from the PRD;
+Dashboard, My portfolios, Holdings, Transactions (with CSV import) and Settings work
+today, and the other sections show what is planned.
+
+```bash
+cd frontend
+npm install
+API_BASE_URL=http://localhost:8000 npm run dev    # http://localhost:3000, sign in with API_TOKEN
+```
+
+The browser never talks to the API directly. Signing in stores the API token in an
+httpOnly, SameSite=Strict cookie, and a server-side proxy (`/api/backend/...`) adds it to
+each request, so page scripts can't read the token.
+
 ## API (`/api/v1`, bearer token required)
 
 | Method | Path | Purpose |
